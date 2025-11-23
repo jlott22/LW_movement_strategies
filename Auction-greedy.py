@@ -38,9 +38,10 @@
 #   * Set UART pins and baud rate to match the hardware.
 #   * Calibrate line sensors and adjust cfg.MIDDLE_WHITE_THRESH accordingly.
 #   * Tune yaw timings (cfg.YAW_90_MS / cfg.YAW_180_MS) for your platform.
-# TODO: fix counting start cell in unique cells
-# ===========================================================
 
+# ===========================================================
+#TODO: edit esp32 code to fit topic changes
+import random
 import time
 import _thread
 import heapq
@@ -56,12 +57,12 @@ from pololu_3pi_2040_robot.buzzer import Buzzer
 # Robot identity & start pose
 # -----------------------------
 ROBOT_ID = "00"  # set to "00", "01", "02", or "03" at deployment
-GRID_SIZE = 10
+GRID_SIZE = 20
 GRID_CENTER = (GRID_SIZE - 1) / 2
 
 DEBUG_LOG_FILE = "debug-log-00.txt"
 
-METRICS_LOG_FILE = "metrics-log-00A.txt"
+METRICS_LOG_FILE = "metrics-log-00AG.txt"
 BOOT_TIME_MS = time.ticks_ms()
 METRIC_START_TIME_MS = None  # set after first post-calibration intersection
 start_signal = False  # set when hub command received
@@ -78,6 +79,8 @@ FIRST_CLUE_POSITION = None      # this robot's position when first clue found (b
 object_location = None          # set when object is found
 system_clues_found = 0          # total unique clues found by all robots
 steps_after_first_clue = 0      # steps taken after first clue was found
+clue_misses = 0                 # simulated clue detections that failed the POD check
+clue_POD = .6  # probability of detection at the clue cell
 
 _metrics_logged = False
 _metrics_cache = None
@@ -141,15 +144,15 @@ def update_mem_headroom():
 
 # Simple energy tracking - message counters only
 position_msgs_sent = 0
-visited_msgs_sent = 0
 clue_msgs_sent = 0
 object_msgs_sent = 0
 intent_msgs_sent = 0
 position_msgs_received = 0
-visited_msgs_received = 0
 clue_msgs_received = 0
 object_msgs_received = 0
 intent_msgs_received = 0
+bytes_sent = 0                 # raw UART bytes sent
+bytes_received = 0             # raw UART bytes received
 # Time metrics
 busy_ms = 0                 # cumulative compute time spent outside motion/sleeps (ms)
 mem_free_min = gc.mem_free()  # lowest observed free heap bytes
@@ -212,9 +215,9 @@ def simple_energy_metrics(elapsed_ms):
     compute_time_ms = max(0, elapsed_ms - motor_time_ms)
 
     # Message totals
-    total_msgs_sent = (position_msgs_sent + visited_msgs_sent + clue_msgs_sent +
+    total_msgs_sent = (position_msgs_sent + clue_msgs_sent +
                       object_msgs_sent + intent_msgs_sent)
-    total_msgs_received = (position_msgs_received + visited_msgs_received +
+    total_msgs_received = (position_msgs_received +
                           clue_msgs_received + object_msgs_received + intent_msgs_received)
 
     return {
@@ -240,6 +243,13 @@ def metrics_log():
     unique_cells = unique_cells_count
     compute_time_ms = max(0, elapsed_ms - motor_time_ms)
     dist_from_first_clue = manhatt_dist_metric(clues[0],FIRST_CLUE_POSITION) if FIRST_CLUE_POSITION is not None and len(clues)>0 else -1
+    steps_before_first_clue = max(0, intersection_count - steps_after_first_clue)
+    time_before_first_clue = FIRST_CLUE_TIME_MS if FIRST_CLUE_TIME_MS is not None else -1
+    time_after_first_clue = elapsed_ms - FIRST_CLUE_TIME_MS if FIRST_CLUE_TIME_MS is not None else -1
+    mem_total = gc.mem_alloc() + gc.mem_free()
+    mem_used_peak = mem_total - mem_free_min
+    cpu_util_pct = (busy_ms * 100) // elapsed_ms if elapsed_ms > 0 else 0
+    bandwidth_bytes = bytes_sent + bytes_received
 
     # Calculate time metrics
     energy = simple_energy_metrics(elapsed_ms)
@@ -248,22 +258,32 @@ def metrics_log():
         "robot_id": ROBOT_ID,
         "object_location": object_location,
         "clue_locations": clues,
+        "first_clue_position": FIRST_CLUE_POSITION,
         "elapsed_ms": elapsed_ms,
         "motor_time_ms": motor_time_ms,
         "compute_time_ms": compute_time_ms,
         "busy_ms": busy_ms,
+        "cpu_util_pct": cpu_util_pct,
+        "mem_used_peak": mem_used_peak,
         "mem_free_min": mem_free_min,
         "steps": intersection_count,
-        "first_clue_time_ms": FIRST_CLUE_TIME_MS if FIRST_CLUE_TIME_MS is not None else -1,
+        "steps_before_first_clue": steps_before_first_clue,
+        "first_clue_time_ms": time_before_first_clue,
+        "time_after_first_clue_ms": time_after_first_clue,
         "dist_from_1st_clue": dist_from_first_clue,
         "steps_after_first_clue": steps_after_first_clue,
         "system_clues_found": system_clues_found,
+        "clues_found": len(clues),
+        "clues_missed": clue_misses,
         "system_revisits": system_revisits,
         "unique_cells": unique_cells,
         "yields": yield_count,
         "goal_replans": goal_replan_count,
         "msgs_sent": energy['msgs_sent'],
         "msgs_received": energy['msgs_received'],
+        "bytes_sent": bytes_sent,
+        "bytes_received": bytes_received,
+        "bandwidth_bytes": bandwidth_bytes,
         "path_replans": path_replan_count,
     }
 
@@ -271,15 +291,22 @@ def metrics_log():
         "robot_id",
         "object_location",
         "clue_locations",
+        "first_clue_position",
         "elapsed_ms",
         "motor_time_ms",
         "compute_time_ms",
         "busy_ms",
+        "cpu_util_pct",
+        "mem_used_peak",
         "mem_free_min",
         "steps",
+        "steps_before_first_clue",
         "first_clue_time_ms",
+        "time_after_first_clue_ms",
         "dist_from_1st_clue",
         "steps_after_first_clue",
+        "clues_found",
+        "clues_missed",
         "system_clues_found",
         "system_revisits",
         "unique_cells",
@@ -287,6 +314,9 @@ def metrics_log():
         "goal_replans",
         "msgs_sent",
         "msgs_received",
+        "bytes_sent",
+        "bytes_received",
+        "bandwidth_bytes",
         "path_replans",
     ]
 
@@ -320,10 +350,10 @@ except OSError:
 # Starting position & heading (grid coordinates, cardinal heading)
 # pos = (x, y)    heading = (dx, dy) where (0,1)=N, (1,0)=E, (0,-1)=S, (-1,0)=W
 START_CONFIG = {
-    "00": ((0, 0), (0, 1)),                       # SW corner, facing north
-    "01": ((GRID_SIZE - 1, GRID_SIZE - 1), (0, -1)),  # NE corner, facing south
-    "02": ((0, GRID_SIZE - 1), (1, 0)),           # NW corner, facing east
-    "03": ((GRID_SIZE - 1, 0), (-1, 0)),          # SE corner, facing west
+    "00": ((0, 0), (1, 0)),                       # west edge, evenly spaced facing east
+    "01": ((0, GRID_SIZE // 4), (1, 0)),
+    "02": ((0, GRID_SIZE // 2), (1, 0)),
+    "03": ((0, (3 * GRID_SIZE) // 4), (1, 0)),
 }
 DIRS4 = ((0, 1), (1, 0), (0, -1), (-1, 0))
 
@@ -350,6 +380,19 @@ prob_map = array('f', [1 / (GRID_SIZE * GRID_SIZE)] * (GRID_SIZE * GRID_SIZE))
 REWARD_FACTOR = 5
 clues = []                            # list of (x, y) clue cells
 
+# --- Target and Clue Belief Maps ---
+# P_target[i]: belief target is at cell i
+# P_clue[i]:   belief there is an undiscovered clue at cell i
+target_p = array('f', [1 / (GRID_SIZE * GRID_SIZE)] * (GRID_SIZE * GRID_SIZE))
+clue_p   = array('f', [1 / (GRID_SIZE * GRID_SIZE)] * (GRID_SIZE * GRID_SIZE))
+
+# --- Decay exponents (tunable) ---
+# Higher exponent -> stronger / narrower decay
+# Lower exponent  -> wider / softer decay
+TARGET_DECAY_EXP = 1.0   # target correlation around clues (tighter)
+CLUE_DECAY_EXP   = 0.5   # future-clue correlation around clues (wider)
+
+
 # Preallocated arrays for A* planning
 # ----------------------------------
 # Parent indices and path costs for each cell are stored here. Reusing these
@@ -364,6 +407,39 @@ def idx(x, y):
     """Convert Cartesian (x, y) to linear index in map arrays."""
     safe_assert(0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE, "idx out of range")
     return (GRID_SIZE - 1 - y) * GRID_SIZE + x
+
+def manhattan(x1, y1, x2, y2):
+    return abs(x1 - x2) + abs(y1 - y2)
+
+
+def renorm(arr):
+    """Normalize an array of floats in-place so it sums to 1 (if possible)."""
+    total = 0.0
+    for v in arr:
+        total += v
+    if total <= 0.0:
+        # fallback: uniform over all cells
+        n = GRID_SIZE * GRID_SIZE
+        val = 1.0 / n
+        for i in range(n):
+            arr[i] = val
+        return
+    inv = 1.0 / total
+    for i in range(len(arr)):
+        arr[i] *= inv
+
+
+def recompute_value_map():
+    """
+    Combine target and clue beliefs into the unified value map used by
+    goal selection and A*.
+      V(i) = P_target(i) + P_clue(i) * clue_POD
+    """
+    n = GRID_SIZE * GRID_SIZE
+    for i in range(n):
+        prob_map[i] = target_p[i] + (clue_p[i] * clue_POD)
+    # Optional: keep it normalized, not strictly required but nice
+    renorm(prob_map)
 
 
 pos = [START_POS[0], START_POS[1]]    # current grid position
@@ -380,7 +456,6 @@ peer_intent = {}  # peer_id -> (x, y) reservation
 peer_pos = {}     # peer_id -> (x, y) last reported position
 peer_goal = {}    # peer_id -> (x, y) goal reservation
 current_goal = None  # our reserved goal cell
-last_visited_from_sender = {}  # sender_id -> (x, y) to detect duplicate visited messages
 
 # -----------------------------
 # Cost shaping for early sweeping pattern
@@ -498,6 +573,9 @@ def buzz(event):
         buzzer.play("O6e16")            # short very high chirp
     elif event == "object":
         buzzer.play("O4c8e8g8c5")       # longer sequence, rising melody
+    elif event == "missed_clue":
+        buzzer.play("O4g16e16")
+
 
 
         
@@ -570,19 +648,21 @@ flash_LEDS(GREEN,1)
 # ===========================================================
 # UART Messaging
 # Format: "<topic#>:<payload>\n"
-# position = 1, visited = 2, clue = 3, alert = 4, intent = 5, result = 6, goal = 7
+# position = 1, intent = 2, goal = 3, clue = 4, alert = 5, result = 6, hub command = 7
 # Examples:
 #   001.3,4-  robot 00 position (x,y only)
-#   003.5,2-  robot 00 clue at (5,2)
-#   005.7,8-  robot 00 intent/reservation at (7,8)
-#   007.9,1-  robot 00 goal reservation at (9,1)
+#   002.7,8-  robot 00 intent/reservation at (7,8)
+#   003.9,1-  robot 00 goal reservation at (9,1)
+#   004.5,2-  robot 00 clue at (5,2)
 # ===========================================================
 def uart_send(topic, payload_len):
     """Send the prepared message in tx_buf with topic and payload_len."""
+    global bytes_sent
     tx_buf[0] = ord(topic)
     tx_buf[1] = ord('.')
     tx_buf[payload_len + 2] = ord('-')
     uart.write(tx_buf[:payload_len + 3])
+    bytes_sent += payload_len + 3
 
 def publish_position():
     """Publish current pose (for UI/diagnostics)."""
@@ -594,16 +674,6 @@ def publish_position():
     i = _write_int(tx_buf, i, pos[1])
     uart_send('1', i - 2)
 
-def publish_visited(x, y):
-    """Publish that we visited cell (x,y)."""
-    global visited_msgs_sent
-    visited_msgs_sent += 1
-    i = 2
-    i = _write_int(tx_buf, i, x)
-    tx_buf[i] = ord(','); i += 1
-    i = _write_int(tx_buf, i, y)
-    uart_send('2', i - 2)
-
 def publish_clue(x, y):
     """Publish a clue at (x,y)."""
     global clue_msgs_sent
@@ -612,7 +682,7 @@ def publish_clue(x, y):
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
     i = _write_int(tx_buf, i, y)
-    uart_send('3', i - 2)
+    uart_send('4', i - 2)
 
 def publish_object(x, y):
     """Publish that we found the object at (x,y)."""
@@ -622,7 +692,7 @@ def publish_object(x, y):
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
     i = _write_int(tx_buf, i, y)
-    uart_send('4', i - 2)
+    uart_send('5', i - 2)
 
 def publish_intent(x, y):
     """
@@ -635,7 +705,7 @@ def publish_intent(x, y):
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
     i = _write_int(tx_buf, i, y)
-    uart_send('5', i - 2)
+    uart_send('2', i - 2)
 
 
 def publish_goal(x, y):
@@ -644,26 +714,28 @@ def publish_goal(x, y):
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
     i = _write_int(tx_buf, i, y)
-    uart_send('7', i - 2)
+    uart_send('3', i - 2)
 
 def publish_result(msg):
     """Publish final search metrics or result to the hub."""
     # ``msg`` can be numeric; ensure it is converted to string before
     # concatenation to avoid ``TypeError: can't convert 'int' object to str``.
-    uart.write("6." + str(msg) + "-")
+    global bytes_sent
+    payload = "6." + str(msg) + "-"
+    uart.write(payload)
+    bytes_sent += len(payload)
 
 def handle_msg(line):
     """
     Parse and apply incoming messages from the other robot or hub.
 
     Accepts:
-    011.3,4-       # topic 1: position (x,y only)
-    002.3,4-       # topic 2: visited
-    003.5,2-       # topic 3: clue
-    004.6,1-       # topic 4: object/alert
-    005.7,2-       # topic 5: intent
-    007.2,3-       # topic 7: goal reservation
-    996.1-         # topic 6: hub command
+    011.3,4-       # topic 1: position (x,y only) - previous pos treated as visited
+    002.7,8-       # topic 2: intent
+    003.9,1-       # topic 3: goal reservation
+    004.5,2-       # topic 4: clue
+    005.6,1-       # topic 5: object/alert
+    996.1-         # topic 7: hub command
 
     Ignores:
       - other status fields we don't currently need
@@ -680,37 +752,7 @@ def handle_msg(line):
     except ValueError:
         return
 
-    if topic == "2":  #visited
-        global visited_msgs_received, system_visits
-        visited_msgs_received += 1
-        try:
-            x, y = map(int, payload.split(","))
-        except ValueError:
-            return
-        if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
-            # Check for duplicate message from same sender (heartbeat spam filter)
-            if last_visited_from_sender.get(sender) == (x, y):
-                # Same cell from same sender - update grid but don't process further
-                i = idx(x, y)
-                grid[i] = CELL_SEARCHED
-                prob_map[i] = 0.0
-                return
-
-            # New cell from this sender - update tracking
-            last_visited_from_sender[sender] = (x, y)
-
-            # Track system-wide visits for system_revisits metric
-            key = (x, y)
-            system_visits[key] = system_visits.get(key, 0) + 1
-
-            # Process normally
-            i = idx(x, y)
-            grid[i] = CELL_SEARCHED
-            prob_map[i] = 0.0
-            if current_goal == (x, y) and not (pos[0] == x and pos[1] == y):
-                current_goal = None
-
-    elif topic == "3":   #clue
+    if topic == "4":   #clue
         global clue_msgs_received, system_clues_found, FIRST_CLUE_POSITION
         clue_msgs_received += 1
         try:
@@ -726,10 +768,15 @@ def handle_msg(line):
                 if FIRST_CLUE_TIME_MS is None and METRIC_START_TIME_MS is not None:
                     FIRST_CLUE_TIME_MS = time.ticks_diff(time.ticks_ms(), METRIC_START_TIME_MS)
                     FIRST_CLUE_POSITION = (pos[0], pos[1])
+                # Use this clue to update both fields
+                widen_clue_field_around(clue[0], clue[1])
+                i = idx(clue[0], clue[1])
+                grid[i] = CELL_SEARCHED
                 update_prob_map()
                 gc.collect()
 
-    elif topic == "4": #object
+
+    elif topic == "5": #object
         # Peer found the object → stop immediately
         global object_msgs_received
         object_msgs_received += 1
@@ -755,11 +802,18 @@ def handle_msg(line):
             px, py = prev
             if 0 <= px < GRID_SIZE and 0 <= py < GRID_SIZE:
                 if peer_intent.get(sender) != (px, py):
-                    grid[idx(px, py)] = CELL_SEARCHED
+                    i_prev = idx(px, py)
+                    grid[i_prev] = CELL_SEARCHED
+                    # Peer searched this cell and did not report a clue/target
+                    system_visits[(px, py)] = system_visits.get((px, py), 0) + 1
+                    update_clue_on_miss(i_prev)
+                    update_target_on_miss(i_prev)
+                    if current_goal == (px, py) and not (pos[0] == px and pos[1] == py):
+                        current_goal = None
         peer_pos[sender] = (ox, oy)
         grid[idx(ox, oy)] = CELL_OBSTACLE
 
-    elif topic == "5": #intent
+    elif topic == "2": #intent
         global intent_msgs_received
         intent_msgs_received += 1
         try:
@@ -776,7 +830,7 @@ def handle_msg(line):
                     grid[idx(px, py)] = CELL_SEARCHED
         peer_intent[sender] = (ix, iy)
         grid[idx(ix, iy)] = CELL_OBSTACLE
-    elif topic == "7": #goal reservation
+    elif topic == "3": #goal reservation
         try:
             gx, gy = map(int, payload.split(","))
         except ValueError:
@@ -786,7 +840,7 @@ def handle_msg(line):
             if current_goal == (gx, gy):
                 # our goal is taken; force replanning
                 current_goal = None
-    elif topic == "6":  # hub command
+    elif topic == "7":  # hub command
         if payload.strip() == "1":
             start_signal = True
 
@@ -820,9 +874,11 @@ def rb_pull_into_msg():
 # ---------- UART service ----------
 def uart_service():
     """Read and parse any complete messages from UART."""
+    global bytes_received
     data = uart.read()     # returns None or bytes object
     if not data:
         return
+    bytes_received += len(data)
     for b in data:         # iterate over bytes
         rb_put_byte(b)
     while True:
@@ -944,9 +1000,9 @@ def calibrate():
     pos[0], pos[1] = START_POS
     if 0 <= pos[0] < GRID_SIZE and 0 <= pos[1] < GRID_SIZE:
         grid[idx(pos[0], pos[1])] = CELL_SEARCHED
+        update_target_on_miss(idx(pos[0], pos[1]))  # start cell is a searched/target-miss cell
     update_prob_map()
     publish_position()
-    publish_visited(pos[0], pos[1])
 
     motors_off()
     METRIC_START_TIME_MS = time.ticks_ms()
@@ -955,14 +1011,23 @@ def calibrate():
 
 def at_intersection_and_white():
     """
-    Detect a 'clue':
+    Detect a 'clue' and simulates POD:
       - Center line sensor reads white ( < cfg.MIDDLE_WHITE_THRESH )
     Returns bool.
     """
+    global clue_misses
     r = line_sensors.read_calibrated()      # [0]..[4], center is [2]
     if r[2] < cfg.MIDDLE_WHITE_THRESH:
-        buzz('clue')
-        return True
+        if random.random() <= clue_POD: # simulate POD
+            flash_LEDS(BLUE,1)
+            buzz('clue')
+            return True
+        else:
+            clue_misses += 1
+            buzz('missed_clue')
+            flash_LEDS(RED,1)
+
+            return False
     else:
         return False
 
@@ -982,11 +1047,16 @@ def check_current_cell_for_clue(stage="start"):
         if FIRST_CLUE_TIME_MS is None and METRIC_START_TIME_MS is not None:
             FIRST_CLUE_TIME_MS = time.ticks_diff(time.ticks_ms(), METRIC_START_TIME_MS)
             FIRST_CLUE_POSITION = (pos[0], pos[1])
-        print(f"[INFO] {stage}: clue detected at {clue}")
         publish_clue(pos[0], pos[1])
         if is_new:
+            widen_clue_field_around(clue[0], clue[1])
             update_prob_map()
             gc.collect()
+    else:
+        # Checked current cell and did not detect a clue
+        if 0 <= pos[0] < GRID_SIZE and 0 <= pos[1] < GRID_SIZE:
+            update_clue_on_miss(idx(pos[0], pos[1]))
+
 
 
 flash_LEDS(GREEN,1)
@@ -1070,27 +1140,87 @@ flash_LEDS(GREEN,1)
 # ===========================================================
 def update_prob_map():
     """
-    Recompute prob_map.
-    - Base uniform prior
-    - Add Manhattan-decay bumps around all clues
-    - Visited cells get zero probability
+    Recompute target_p from all known clues (if any), then update prob_map
+    as the unified value map:
+        V(i) = P_target(i) + P_clue(i) * clue_POD
+
+    Pre-clue (no clues yet):
+        - We leave target_p as-is (typically uniform) and just recompute value.
+        - clue_p is maintained incrementally via misses and widen_clue_field_around.
+    Post-clue:
+        - target_p[i] ∝ sum_k 1 / (1 + d(i, clue_k))**TARGET_DECAY_EXP
+          for unsearched cells; 0 for visited.
+        - clue_p has already been widened around clue locations.
     """
-    # Simple energy tracking - no function call counting needed
-    total_cells = GRID_SIZE * GRID_SIZE
     has_clues = len(clues) > 0
+
+    if has_clues:
+        # Rebuild target_p from the clues with tunable target decay
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                i = idx(x, y)
+                if grid[i] == CELL_SEARCHED:  # visited: target cannot be here (POD_target=1)
+                    target_p[i] = 0.0
+                    continue
+                s = 0.0
+                for (cx, cy) in clues:
+                    d = manhattan(x, y, cx, cy)
+                    s += 1.0 / ((1.0 + d) ** TARGET_DECAY_EXP)
+                target_p[i] = s
+        renorm(target_p)
+
+    # Whether or not we have clues, recompute the unified value map
+    recompute_value_map()
+
+
+def update_clue_on_miss(i):
+    """
+    We searched cell i for a clue and did NOT detect one.
+    Update clue_p[i] using a simple Bayes miss step with POD_clue.
+    """
+    p_i = clue_p[i]
+    if p_i <= 0.0:
+        return
+    # Simple shrink then renormalize (approximate Bayes):
+    clue_p[i] = p_i * (1.0 - clue_POD)
+    renorm(clue_p)
+    recompute_value_map()
+
+def update_target_on_miss(i):
+    """
+    We have effectively searched cell i for the target (POD_target = 1)
+    and did NOT find it. Set P_target(i) = 0 and renormalize.
+    """
+    if target_p[i] <= 0.0:
+        return
+    target_p[i] = 0.0
+    renorm(target_p)
+    recompute_value_map()
+
+
+def widen_clue_field_around(cx, cy):
+    """
+    When we detect a clue at (cx, cy), that location joins 'clues' for the
+    target correlation, AND we update clue_p to reflect that future clues
+    are more likely in this general area, but with a WIDER decay.
+    """
+    n = GRID_SIZE * GRID_SIZE
+    # Add a wide bump around (cx, cy)
     for y in range(GRID_SIZE):
         for x in range(GRID_SIZE):
             i = idx(x, y)
-            if grid[i] == CELL_SEARCHED:  # visited
-                prob_map[i] = 0.0
+            if grid[i] == CELL_OBSTACLE:
+                clue_p[i] = 0.0
                 continue
-            if not has_clues:
-                prob_map[i] = 1.0 / total_cells
-                continue
-            s = 0.0
-            for (cx, cy) in clues:
-                s += 1.0 / (1 + abs(x - cx) + abs(y - cy))
-            prob_map[i] = s
+            d = manhattan(x, y, cx, cy)
+            # Wider decay: exponent CLUE_DECAY_EXP (usually < TARGET_DECAY_EXP)
+            bump = 1.0 / ((1.0 + d) ** CLUE_DECAY_EXP)
+            clue_p[i] += bump
+    # We've already found the clue at (cx, cy); don't look for another there
+    clue_p[idx(cx, cy)] = 0.0
+    renorm(clue_p)
+    recompute_value_map()
+
 
 def distance_from_center(coord):
     """Return the distance from the grid center along one axis.
@@ -1340,7 +1470,6 @@ def search_loop():
             now = time.ticks_ms()
             if time.ticks_diff(now, last_pose_publish) >= 3000:
                 publish_position()
-                publish_visited(pos[0],pos[1])
                 last_pose_publish = now
             time.sleep_ms(10)
         METRIC_START_TIME_MS = time.ticks_ms()
@@ -1409,13 +1538,14 @@ def search_loop():
                 # Arrived + update state & publish
                 pos[0], pos[1] = nxt[0], nxt[1]
                 record_intersection(pos[0], pos[1])
-                grid[idx(pos[0], pos[1])] = CELL_SEARCHED
+                cell_i = idx(pos[0], pos[1])
+                grid[cell_i] = CELL_SEARCHED
                 publish_position()
-                publish_visited(pos[0], pos[1])
+                update_target_on_miss(cell_i)
 
                 # Clue detection: centered + white center sensor
-                if at_intersection_and_white():
-                    buzz('clue')
+                detected = at_intersection_and_white()
+                if detected:
                     clue = (pos[0], pos[1])
                     if clue not in clues:
                         clues.append(clue)
@@ -1425,9 +1555,16 @@ def search_loop():
                             FIRST_CLUE_TIME_MS = time.ticks_diff(time.ticks_ms(), METRIC_START_TIME_MS)
                             FIRST_CLUE_POSITION = (pos[0], pos[1])
                         publish_clue(pos[0], pos[1])
-                        update_prob_map()
+
+                        # Update both target and clue beliefs around the new clue
+                        widen_clue_field_around(clue[0], clue[1])
+                        update_prob_map()      # rebuild target_p from all clues, recompute value
                         update_mem_headroom()
                         gc.collect()
+                else:
+                    # We searched this cell and did NOT detect a clue
+                    update_clue_on_miss(cell_i)
+
             finally:
                 busy_ms += busy_timer_value_ms()
                 update_mem_headroom()
@@ -1452,6 +1589,8 @@ finally:
     metrics_log()
     flash_LEDS(RED,5)
     time.sleep_ms(200)  # give RX thread time to fall out cleanly
+
+
 
 
 
