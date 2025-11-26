@@ -26,7 +26,7 @@
 #     probability scores.
 #   * The next intended cell is published so peers can yield and avoid
 #     collisions.
-#   * Bump sensors detect the object; on a bump both robots halt and report.
+#   * Bump sensors detect the target; on a bump both robots halt and report.
 #   * A clue is any intersection where the centered line sensor reads white.
 #
 # Threads:
@@ -40,7 +40,6 @@
 #   * Tune yaw timings (cfg.YAW_90_MS / cfg.YAW_180_MS) for your platform.
 
 # ===========================================================
-#TODO: edit esp32 code to fit topic changes
 import random
 import time
 import _thread
@@ -56,13 +55,13 @@ from pololu_3pi_2040_robot.buzzer import Buzzer
 # -----------------------------
 # Robot identity & start pose
 # -----------------------------
-ROBOT_ID = "00"  # set to "00", "01", "02", or "03" at deployment
-GRID_SIZE = 20
+ROBOT_ID = "03"  # set to "00", "01", "02", or "03" at deployment
+GRID_SIZE = 19
 GRID_CENTER = (GRID_SIZE - 1) / 2
 
-DEBUG_LOG_FILE = "debug-log-00.txt"
+DEBUG_LOG_FILE = "debug-log.txt"
 
-METRICS_LOG_FILE = "metrics-log-00AG.txt"
+METRICS_LOG_FILE = "metrics-log-AG.txt"
 BOOT_TIME_MS = time.ticks_ms()
 METRIC_START_TIME_MS = None  # set after first post-calibration intersection
 start_signal = False  # set when hub command received
@@ -76,11 +75,11 @@ path_replan_count = 0           # times we replanned due to collision avoidance
 goal_replan_count = 0           # times our goal changed and we replanned
 FIRST_CLUE_TIME_MS = None       # ms from start to first clue (by any robot)
 FIRST_CLUE_POSITION = None      # this robot's position when first clue found (by any robot)
-object_location = None          # set when object is found
+target_location = None          # set when target is found
 system_clues_found = 0          # total unique clues found by all robots
 steps_after_first_clue = 0      # steps taken after first clue was found
 clue_misses = 0                 # simulated clue detections that failed the POD check
-clue_POD = .6  # probability of detection at the clue cell
+clue_POD = .7  # probability of detection at the clue cell
 
 _metrics_logged = False
 _metrics_cache = None
@@ -145,12 +144,14 @@ def update_mem_headroom():
 # Simple energy tracking - message counters only
 position_msgs_sent = 0
 clue_msgs_sent = 0
-object_msgs_sent = 0
+target_msgs_sent = 0
 intent_msgs_sent = 0
+goal_msgs_sent = 0
 position_msgs_received = 0
 clue_msgs_received = 0
-object_msgs_received = 0
+target_msgs_received = 0
 intent_msgs_received = 0
+goal_msgs_received = 0
 bytes_sent = 0                 # raw UART bytes sent
 bytes_received = 0             # raw UART bytes received
 # Time metrics
@@ -216,9 +217,9 @@ def simple_energy_metrics(elapsed_ms):
 
     # Message totals
     total_msgs_sent = (position_msgs_sent + clue_msgs_sent +
-                      object_msgs_sent + intent_msgs_sent)
+                      target_msgs_sent + intent_msgs_sent + goal_msgs_sent)
     total_msgs_received = (position_msgs_received +
-                          clue_msgs_received + object_msgs_received + intent_msgs_received)
+                          clue_msgs_received + target_msgs_received + intent_msgs_received + goal_msgs_received)
 
     return {
         'motor_time_ms': motor_time_ms,
@@ -256,7 +257,7 @@ def metrics_log():
 
     metrics = {
         "robot_id": ROBOT_ID,
-        "object_location": object_location,
+        "target_location": target_location,
         "clue_locations": clues,
         "first_clue_position": FIRST_CLUE_POSITION,
         "elapsed_ms": elapsed_ms,
@@ -289,7 +290,7 @@ def metrics_log():
 
     fieldnames = [
         "robot_id",
-        "object_location",
+        "target_location",
         "clue_locations",
         "first_clue_position",
         "elapsed_ms",
@@ -351,9 +352,9 @@ except OSError:
 # pos = (x, y)    heading = (dx, dy) where (0,1)=N, (1,0)=E, (0,-1)=S, (-1,0)=W
 START_CONFIG = {
     "00": ((0, 0), (1, 0)),                       # west edge, evenly spaced facing east
-    "01": ((0, GRID_SIZE // 4), (1, 0)),
-    "02": ((0, GRID_SIZE // 2), (1, 0)),
-    "03": ((0, (3 * GRID_SIZE) // 4), (1, 0)),
+    "01": ((0, 5), (1, 0)),
+    "02": ((0, 10), (1, 0)),
+    "03": ((0, 15), (1, 0)),
 }
 DIRS4 = ((0, 1), (1, 0), (0, -1), (-1, 0))
 
@@ -364,6 +365,22 @@ except KeyError as e:
 safe_assert(0 <= START_POS[0] < GRID_SIZE and 0 <= START_POS[1] < GRID_SIZE,
             "start position out of bounds")
 
+#for starting partition
+BANDS = {
+    "00": (0, 4),
+    "01": (5, 9),
+    "02": (10, 14),
+    "03": (15, 18),
+}
+try:
+    BAND_Y_MIN, BAND_Y_MAX = BANDS[ROBOT_ID]
+except KeyError as e:
+    raise ValueError("No band defined for this ROBOT_ID") from e
+
+safe_assert(0 <= BAND_Y_MIN <= BAND_Y_MAX < GRID_SIZE, "band rows out of bounds")
+safe_assert(BAND_Y_MIN <= START_POS[1] <= BAND_Y_MAX,
+            "start row must lie inside this robot's band")
+
 # UART0 for ESP32 communication (TX=GP28, RX=GP29)
 uart = UART(0, baudrate=115200, tx=28, rx=29)
 
@@ -372,7 +389,7 @@ uart = UART(0, baudrate=115200, tx=28, rx=29)
 # -----------------------------
 # Grid cell states
 CELL_UNSEARCHED = 0
-CELL_OBSTACLE   = 1  # object or peer reservation
+CELL_OBSTACLE   = 1  # target or peer reservation
 CELL_SEARCHED   = 2
 
 grid = bytearray(GRID_SIZE * GRID_SIZE)
@@ -447,7 +464,7 @@ heading = (START_HEADING[0], START_HEADING[1])
 
 # Flags used by threads for clean exits
 running = True                         # global run flag
-found_object = False                   # set True on bump or peer alert
+found_target = False                   # set True on bump or peer alert
 first_clue_seen = False                # once True, disable lawn‑mower bias
 move_forward_flag = False
 
@@ -457,12 +474,8 @@ peer_pos = {}     # peer_id -> (x, y) last reported position
 peer_goal = {}    # peer_id -> (x, y) goal reservation
 current_goal = None  # our reserved goal cell
 
-# -----------------------------
-# Cost shaping for early sweeping pattern
-# A small cost per step toward the center keeps robots sweeping their region
-# before clues are discovered. It must exceed the TURN_COST (1.0).
+
 TURN_COST = 1.0
-CENTER_STEP = 0.4
 
 # -----------------------------
 # Motion configuration
@@ -471,18 +484,18 @@ class MotionConfig:
     def __init__(self):
         self.MIDDLE_WHITE_THRESH = 200  # center sensor threshold for "white" (tune by calibration)
         self.VISITED_STEP_PENALTY = 4
-        self.KP = 0.5                # proportional gain around LINE_CENTER
-        self.CALIBRATE_SPEED = 1130  # speed to rotate when calibrating
-        self.BASE_SPEED = 800        # nominal wheel speed
-        self.MIN_SPD = 400           # clamp low (avoid stall)
-        self.MAX_SPD = 1200          # clamp high
+        self.KP = 0.7                # proportional gain around LINE_CENTER
+        self.CALIBRATE_SPEED = 1140  # speed to rotate when calibrating
+        self.BASE_SPEED = 650        # nominal wheel speed
+        self.MIN_SPD = 350           # clamp low (avoid stall)
+        self.MAX_SPD = 1100          # clamp high
         self.LINE_CENTER = 2000      # weighted position target (0..4000)
         self.BLACK_THRESH = 600      # calibrated "black" threshold (0..1000)
-        self.STRAIGHT_CREEP = 900    # forward speed while "locked" straight
-        self.START_LOCK_MS = 300     # hold straight this long after function starts
+        self.STRAIGHT_CREEP = 650    # forward speed while "locked" straight
+        self.START_LOCK_MS = 250     # hold straight this long after function starts
         self.TURN_SPEED = 1000
-        self.YAW_90_MS = 0.3
-        self.YAW_180_MS = 0.6
+        self.YAW_90_MS = 0.31
+        self.YAW_180_MS = 0.61
 
 cfg = MotionConfig()
 
@@ -563,7 +576,7 @@ def flash_LEDS(color, n):
 def buzz(event):
     """
     Play short chirps for turn, intersection, clue,
-    and a longer sequence for object.
+    and a longer sequence for target.
     """
     if event == "turn":
         buzzer.play("O5c16")            # short high chirp
@@ -571,7 +584,7 @@ def buzz(event):
         buzzer.play("O4g16")            # short mid chirp
     elif event == "clue":
         buzzer.play("O6e16")            # short very high chirp
-    elif event == "object":
+    elif event == "target":
         buzzer.play("O4c8e8g8c5")       # longer sequence, rising melody
     elif event == "missed_clue":
         buzzer.play("O4g16e16")
@@ -606,24 +619,22 @@ def stop_all():
     global running
     running = False
     motors_off()
-    summary = metrics_log()
-    publish_result(summary)
 
-def stop_and_alert_object():
+def stop_and_alert_target():
     """
-    Called when THIS robot detects the object via bump.
+    Called when THIS robot detects the target via bump.
     Publishes alert and performs a global stop.
 
-    The robot may bump into the object before reaching the next
+    The robot may bump into the target before reaching the next
     intersection, leaving ``pos`` pointing to the last intersection it
-    successfully crossed.  Report the object at the *next* intersection in
+    successfully crossed.  Report the target at the *next* intersection in
     the current heading direction so external consumers know where it is.
     """
-    global object_location, found_object, intersection_count, steps_after_first_clue
+    global target_location, found_target, intersection_count, steps_after_first_clue
     global intersection_visits, system_visits, system_revisits, unique_cells_count
     next_x = pos[0] + heading[0]
     next_y = pos[1] + heading[1]
-    object_location = (next_x, next_y)
+    target_location = (next_x, next_y)
     key = (next_x, next_y)
     first_visit = key not in system_visits
     if not first_visit:
@@ -636,9 +647,9 @@ def stop_and_alert_object():
         intersection_visits[key] += 1
     else:
         intersection_visits[key] = 1
-    publish_object(next_x, next_y)
-    buzz('object')
-    found_object = True
+    publish_target(next_x, next_y)
+    buzz('target')
+    found_target = True
     intersection_count += 1
     steps_after_first_clue += 1
     stop_all()
@@ -648,7 +659,7 @@ flash_LEDS(GREEN,1)
 # ===========================================================
 # UART Messaging
 # Format: "<topic#>:<payload>\n"
-# position = 1, intent = 2, goal = 3, clue = 4, alert = 5, result = 6, hub command = 7
+# position = 1, intent = 2, goal = 3, clue = 4, alert = 5, syncstate (not used in this code) = 6, hub command = 7
 # Examples:
 #   001.3,4-  robot 00 position (x,y only)
 #   002.7,8-  robot 00 intent/reservation at (7,8)
@@ -684,10 +695,10 @@ def publish_clue(x, y):
     i = _write_int(tx_buf, i, y)
     uart_send('4', i - 2)
 
-def publish_object(x, y):
-    """Publish that we found the object at (x,y)."""
-    global object_msgs_sent
-    object_msgs_sent += 1
+def publish_target(x, y):
+    """Publish that we found the target at (x,y)."""
+    global target_msgs_sent
+    target_msgs_sent += 1
     i = 2
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
@@ -710,20 +721,13 @@ def publish_intent(x, y):
 
 def publish_goal(x, y):
     """Publish our reserved goal cell."""
+    global goal_msgs_sent
+    goal_msgs_sent += 1
     i = 2
     i = _write_int(tx_buf, i, x)
     tx_buf[i] = ord(','); i += 1
     i = _write_int(tx_buf, i, y)
     uart_send('3', i - 2)
-
-def publish_result(msg):
-    """Publish final search metrics or result to the hub."""
-    # ``msg`` can be numeric; ensure it is converted to string before
-    # concatenation to avoid ``TypeError: can't convert 'int' object to str``.
-    global bytes_sent
-    payload = "6." + str(msg) + "-"
-    uart.write(payload)
-    bytes_sent += len(payload)
 
 def handle_msg(line):
     """
@@ -734,13 +738,13 @@ def handle_msg(line):
     002.7,8-       # topic 2: intent
     003.9,1-       # topic 3: goal reservation
     004.5,2-       # topic 4: clue
-    005.6,1-       # topic 5: object/alert
+    005.6,1-       # topic 5: target/alert
     996.1-         # topic 7: hub command
 
     Ignores:
       - other status fields we don't currently need
     """
-    global peer_intent, peer_pos, peer_goal, current_goal, first_clue_seen, object_location, start_signal, found_object, FIRST_CLUE_TIME_MS, goal_replan_count
+    global peer_intent, peer_pos, peer_goal, current_goal, first_clue_seen, target_location, start_signal, found_target, FIRST_CLUE_TIME_MS, goal_replan_count
 
     # Minimal parsing: "<sender>/<topic>:<payload>"
     try:
@@ -769,23 +773,23 @@ def handle_msg(line):
                     FIRST_CLUE_TIME_MS = time.ticks_diff(time.ticks_ms(), METRIC_START_TIME_MS)
                     FIRST_CLUE_POSITION = (pos[0], pos[1])
                 # Use this clue to update both fields
-                widen_clue_field_around(clue[0], clue[1])
+                clue_probability_field(clue[0], clue[1])
                 i = idx(clue[0], clue[1])
                 grid[i] = CELL_SEARCHED
                 update_prob_map()
                 gc.collect()
 
 
-    elif topic == "5": #object
-        # Peer found the object → stop immediately
-        global object_msgs_received
-        object_msgs_received += 1
+    elif topic == "5": #target
+        # Peer found the target → stop immediately
+        global target_msgs_received
+        target_msgs_received += 1
         try:
             x, y = map(int, payload.split(","))
-            object_location = (x, y)
+            target_location = (x, y)
         except ValueError:
-            object_location = None
-        found_object = True
+            target_location = None
+        found_target = True
         stop_all()
 
     elif topic == "1": #position
@@ -831,6 +835,8 @@ def handle_msg(line):
         peer_intent[sender] = (ix, iy)
         grid[idx(ix, iy)] = CELL_OBSTACLE
     elif topic == "3": #goal reservation
+        global goal_msgs_received
+        goal_msgs_received += 1
         try:
             gx, gy = map(int, payload.split(","))
         except ValueError:
@@ -875,7 +881,7 @@ def rb_pull_into_msg():
 def uart_service():
     """Read and parse any complete messages from UART."""
     global bytes_received
-    data = uart.read()     # returns None or bytes object
+    data = uart.read()     # returns None or bytes target
     if not data:
         return
     bytes_received += len(data)
@@ -914,7 +920,7 @@ def move_forward_one_cell():
     while running:
         
         while move_forward_flag:
-            # 1) Safety/object check
+            # 1) Safety/target check
             if first_loop:
                 # Initial lock to roll straight for half a second
                 lock_release_time = time.ticks_add(time.ticks_ms(), cfg.START_LOCK_MS)
@@ -937,7 +943,7 @@ def move_forward_one_cell():
             
             bump.read()
             if bump.left_is_pressed() or bump.right_is_pressed():
-                stop_and_alert_object()
+                stop_and_alert_target()
                 motors_off()
                 move_forward_flag = False
                 break    
@@ -1035,7 +1041,7 @@ def at_intersection_and_white():
 def check_current_cell_for_clue(stage="start"):
     """Check the current cell for a clue without moving off of it."""
     global first_clue_seen, FIRST_CLUE_TIME_MS, system_clues_found, FIRST_CLUE_POSITION
-    if not running or found_object:
+    if not running or found_target:
         return
     if at_intersection_and_white():
         clue = (pos[0], pos[1])
@@ -1049,7 +1055,7 @@ def check_current_cell_for_clue(stage="start"):
             FIRST_CLUE_POSITION = (pos[0], pos[1])
         publish_clue(pos[0], pos[1])
         if is_new:
-            widen_clue_field_around(clue[0], clue[1])
+            clue_probability_field(clue[0], clue[1])
             update_prob_map()
             gc.collect()
     else:
@@ -1076,7 +1082,7 @@ def rotate_degrees(deg):
     
     #inch forward to make clean turn
     set_speeds(cfg.BASE_SPEED, cfg.BASE_SPEED)
-    time.sleep(.2)
+    time.sleep(.3)
     motors_off()
 
     if deg == 180 or deg == -180:
@@ -1146,7 +1152,7 @@ def update_prob_map():
 
     Pre-clue (no clues yet):
         - We leave target_p as-is (typically uniform) and just recompute value.
-        - clue_p is maintained incrementally via misses and widen_clue_field_around.
+        - clue_p is maintained incrementally via misses and clue_probability_field.
     Post-clue:
         - target_p[i] ∝ sum_k 1 / (1 + d(i, clue_k))**TARGET_DECAY_EXP
           for unsearched cells; 0 for visited.
@@ -1198,7 +1204,7 @@ def update_target_on_miss(i):
     recompute_value_map()
 
 
-def widen_clue_field_around(cx, cy):
+def clue_probability_field(cx, cy):
     """
     When we detect a clue at (cx, cy), that location joins 'clues' for the
     target correlation, AND we update clue_p to reflect that future clues
@@ -1220,32 +1226,6 @@ def widen_clue_field_around(cx, cy):
     clue_p[idx(cx, cy)] = 0.0
     renorm(clue_p)
     recompute_value_map()
-
-
-def distance_from_center(coord):
-    """Return the distance from the grid center along one axis.
-
-    Used to penalize center-ward moves before the first clue is seen, without
-    assigning robots to specific sides of the grid.
-    """
-    return abs(coord - GRID_CENTER)
-
-def centerward_step_cost(curr_x, curr_y, next_x, next_y):
-    """Pre-clue only: Penalize steps that move inward toward the center on either axis."""
-    if first_clue_seen:
-        return 0.0
-    cost = 0.0
-    if next_x != curr_x:
-        d_curr = distance_from_center(curr_x)
-        d_next = distance_from_center(next_x)
-        if d_next < d_curr:
-            cost += CENTER_STEP * (d_curr - d_next)
-    if next_y != curr_y:
-        d_curr = distance_from_center(curr_y)
-        d_next = distance_from_center(next_y)
-        if d_next < d_curr:
-            cost += CENTER_STEP * (d_curr - d_next)
-    return cost
 
 def i_should_yield(ix, iy):
     """Yield if a peer reserved or currently occupies (ix, iy)."""
@@ -1343,6 +1323,70 @@ def pick_goal():
     if unknowns:
         return min(unknowns, key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1]))
     return None
+
+def next_serpentine_goal_in_band():
+    """
+    Pre-clue: return the next unsearched cell in this robot's row band
+    following a serpentine (boustrophedon) pattern.
+
+    Order within the band:
+      row BAND_Y_MIN: x=0..GRID_SIZE-1
+      row BAND_Y_MIN+1: x=GRID_SIZE-1..0
+      row BAND_Y_MIN+2: x=0..GRID_SIZE-1
+      ...
+    We start from the *current* position in that ordering and pick the
+    first later cell that is still CELL_UNSEARCHED. If none remain, return None.
+    """
+    # If somehow we're outside our band, clamp the logical "current row"
+    cur_x, cur_y = pos[0], pos[1]
+    if cur_y < BAND_Y_MIN:
+        cur_y = BAND_Y_MIN
+    elif cur_y > BAND_Y_MAX:
+        cur_y = BAND_Y_MAX
+
+    passed_current = False
+
+    for y in range(BAND_Y_MIN, BAND_Y_MAX + 1):
+        # serpentine direction for this row
+        # even offset rows (relative to BAND_Y_MIN) go left->right
+        # odd offset rows go right->left
+        row_offset = y - BAND_Y_MIN
+        if row_offset % 2 == 0:
+            x_iter = range(0, GRID_SIZE)
+        else:
+            x_iter = range(GRID_SIZE - 1, -1, -1)
+
+        for x in x_iter:
+            # find where we are in the ordering
+            if not passed_current:
+                if x == cur_x and y == cur_y:
+                    passed_current = True
+                continue
+
+            i = idx(x, y)
+            if grid[i] == CELL_UNSEARCHED:
+                return (x, y)
+
+    # No unsearched cells after current position → check if there are any
+    # earlier ones in the band (e.g., if we started mid-band)
+    for y in range(BAND_Y_MIN, BAND_Y_MAX + 1):
+        row_offset = y - BAND_Y_MIN
+        if row_offset % 2 == 0:
+            x_iter = range(0, GRID_SIZE)
+        else:
+            x_iter = range(GRID_SIZE - 1, -1, -1)
+
+        for x in x_iter:
+            if x == cur_x and y == cur_y:
+                # we already checked "after" current; don't wrap forever
+                return None
+            i = idx(x, y)
+            if grid[i] == CELL_UNSEARCHED:
+                return (x, y)
+
+    # Entire band fully searched
+    return None
+
 flash_LEDS(GREEN,1)
 # ===========================================================
 # A* Planner (4-neighbor grid, cardinal)
@@ -1352,7 +1396,6 @@ def a_star(start, goal):
     A* over the 4-neighbor grid, with costs:
       +1 per step
       + TURN_COST per 90-degree heading change
-      + centerward_step_cost (pre-clue serpentine)
       + cfg.VISITED_STEP_PENALTY if stepping onto a visited cell (grid==2)
       + INTENT_PENALTY if stepping into the other's reserved next cell or current position
     The reward from prob_map is applied as a bonus in the node priority.
@@ -1371,7 +1414,7 @@ def a_star(start, goal):
     cost_so_far[start_idx] = 0.0
     turn_cost_per_turn = TURN_COST if not first_clue_seen else TURN_COST * 0.5
 
-    while frontier and running and not found_object:
+    while frontier and running and not found_target:
         _, current_idx, cur_dir = heapq.heappop(frontier)
         if current_idx == goal_idx:
             break
@@ -1390,8 +1433,7 @@ def a_star(start, goal):
             turns = quarter_turns(cur_dir, (dx, dy))
             turn_cost = turn_cost_per_turn * turns
             visited_pen = cfg.VISITED_STEP_PENALTY if grid[i] == CELL_SEARCHED else 0.0
-            serp_pen = centerward_step_cost(cx, cy, nx, ny)
-            base_cost = move_cost + turn_cost + visited_pen + serp_pen
+            base_cost = move_cost + turn_cost + visited_pen
 
             for pid, (ix, iy) in peer_intent.items():
                 if (ix, iy) == (nx, ny):
@@ -1453,7 +1495,7 @@ def search_loop():
     3. Plan with A* using turn, center, intent, and reward costs.
     4. Publish intent, turn, and advance one cell (abort on bump).
     5. Mark the cell, report status, and check for clues.
-    6. Repeat until the object is found or no goals remain.
+    6. Repeat until the target is found or no goals remain.
 
     Motors are always stopped in a ``finally`` block.
     """
@@ -1475,7 +1517,7 @@ def search_loop():
         METRIC_START_TIME_MS = time.ticks_ms()
         check_current_cell_for_clue("start_signal")
 
-        while running and not found_object:
+        while running and not found_target:
             busy_timer_reset()
             # free any unused memory from previous iteration to avoid
             # MicroPython allocation failures during long searches
@@ -1484,7 +1526,10 @@ def search_loop():
 
             try:
                 prev_goal = current_goal
-                goal = pick_goal()
+                if not first_clue_seen:
+                    goal = next_serpentine_goal_in_band()
+                else:
+                    goal = pick_goal()
                 if goal is None:
                     current_goal = None
                     break
@@ -1526,7 +1571,7 @@ def search_loop():
                 # Face the neighbor and try to move one cell
                 busy_timer_pause()
                 turn_towards(tuple(pos), nxt)
-                if not running or found_object:
+                if not running or found_target:
                     break
 
                 move_forward_flag = True
@@ -1557,7 +1602,7 @@ def search_loop():
                         publish_clue(pos[0], pos[1])
 
                         # Update both target and clue beliefs around the new clue
-                        widen_clue_field_around(clue[0], clue[1])
+                        clue_probability_field(clue[0], clue[1])
                         update_prob_map()      # rebuild target_p from all clues, recompute value
                         update_mem_headroom()
                         gc.collect()
